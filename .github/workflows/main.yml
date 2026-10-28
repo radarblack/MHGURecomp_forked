@@ -1,0 +1,63 @@
+name: Windows runtime build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  build-runtime:
+    name: Compile Windows runtime (no game dump required)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2 UCRT64 and dependencies
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make
+            git
+            diffutils
+            curl
+            tar
+            mingw-w64-ucrt-x86_64-clang
+            mingw-w64-ucrt-x86_64-lld
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-sdl3
+            mingw-w64-ucrt-x86_64-shaderc
+            mingw-w64-ucrt-x86_64-nasm
+            mingw-w64-ucrt-x86_64-vulkan-headers
+            mingw-w64-ucrt-x86_64-vulkan-loader
+            mingw-w64-ucrt-x86_64-vulkan-memory-allocator
+
+      - name: Show toolchain versions
+        run: |
+          clang --version
+          make --version
+
+      # Building this target compiles and links the host runtime, including
+      # runtime/host_input.c. It deliberately does not run `make gen` or `make all`,
+      # because those steps require the user's own MHGU 1.4.0 exefs/romfs files.
+      - name: Compile and link runtime executable
+        run: make -j2 build/mhgurecomp.exe
+
+      - name: Upload runtime executable (not a complete playable build)
+        uses: actions/upload-artifact@v4
+        with:
+          name: mhgurecomp-windows-runtime-${{ github.sha }}
+          path: build/mhgurecomp.exe
+          if-no-files-found: error
+          retention-days: 14
