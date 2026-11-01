@@ -6,6 +6,7 @@
 //                          none (the R9's driver), Off: immediate. MHGU_VK_PRESENT=fifo|mailbox|immediate picks the present mode directly.
 //   MHGU_SHOT_AT=<frame>[,<frame>...]   save the window image at those presented frames as shots/frame_N.png
 //   MHGU_FPS=1             frames per second in the log every 2 s
+//   MHGU_NO_BC=1           act as if the GPU had no BC textures, as phone GPUs (they are decoded on the CPU then)
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <math.h>
@@ -16,11 +17,21 @@
 
 #include "../../overlay.h"
 #include "fsr.h"
-#include "fsr4.h"
 #include "vk.h"
 
 VkG g_vk;
 static VkDebugUtilsMessengerEXT messenger;
+// Windows: the swapchain says it never wants exclusive full screen (VK_EXT_full_screen_exclusive). Otherwise NVIDIA's
+// driver takes a borderless window covering the screen into exclusive mode, and alt-tab or F11 then blacks out the
+// monitor until its "Vulkan/OpenGL present method" is set to "Prefer layered on DXGI Swapchain" (issue #100).
+// VkSurfaceFullScreenExclusiveInfoEXT and its enum live in vulkan_win32.h, which needs windows.h: the same layout here.
+typedef struct {
+    VkStructureType sType;
+    void *pNext;
+    int32_t fullScreenExclusive;  // VkFullScreenExclusiveEXT
+} FullScreenExclusiveInfo;
+enum { FULL_SCREEN_EXCLUSIVE_DISALLOWED = 2 };  // VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT
+static bool surface_caps2, no_exclusive;  // VK_KHR_get_surface_capabilities2 (instance), VK_EXT_full_screen_exclusive
 
 static pthread_mutex_t g_vk_mutex = PTHREAD_MUTEX_INITIALIZER;
 static volatile bool g_vk_owner;  // who holds it: exit() may run inside a submission, from the guest's own code
@@ -65,13 +76,21 @@ static void create_instance(void) {
     if (!sdl_ext) FATAL("SDL_Vulkan_GetInstanceExtensions: %s (is the window a Vulkan window?)\n", SDL_GetError());
     const char *ext[16];
     uint32_t n_ext = 0;
-    for (Uint32 i = 0; i < n_sdl && n_ext < 14; i++) ext[n_ext++] = sdl_ext[i];
+    for (Uint32 i = 0; i < n_sdl && n_ext < 13; i++) ext[n_ext++] = sdl_ext[i];
+    uint32_t ni = 0;  // VK_EXT_full_screen_exclusive (create_device) needs this one
+    vkEnumerateInstanceExtensionProperties(NULL, &ni, NULL);
+    VkExtensionProperties *ip = calloc(ni ? ni : 1, sizeof *ip);
+    vkEnumerateInstanceExtensionProperties(NULL, &ni, ip);
+    for (uint32_t i = 0; i < ni; i++)
+        if (!strcmp(ip[i].extensionName, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)) surface_caps2 = true;
+    free(ip);
+    if (surface_caps2) ext[n_ext++] = VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME;
     bool validate = getenv("MHGU_VK_VALIDATION") != NULL;
     if (validate) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
     const char *layers[] = {"VK_LAYER_KHRONOS_validation"};
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "MHGURecomp",
                              .pEngineName = "MHGURecomp",
-                             .apiVersion = g_config.fsr && g_config.fsr_upscaler == FSR_UP_4 ? VK_API_VERSION_1_3 : VK_API_VERSION_1_2};  // (FSR 4's shaders use SPIR-V 1.6)
+                             .apiVersion = VK_API_VERSION_1_2};
     VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
                                .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext,
                                .enabledLayerCount = validate ? 1 : 0, .ppEnabledLayerNames = layers};
@@ -102,6 +121,14 @@ static bool has_ext(VkExtensionProperties *e, uint32_t n, const char *name) {
 }
 
 // Discrete GPU first (MHGU_GPU=<index> picks one); needs Vulkan 1.2 and a queue that can draw, compute and present.
+// The device can't run the game: the player sees why, not "the details are in log.txt" (which a phone can't easily open)
+static void no_vulkan_1_2(const char *why) {
+    LOG("[vk] %s (Vulkan 1.2 required)\n", why);
+    plat_error_box("This device's GPU driver does not support Vulkan 1.2, which the game needs. A system or GPU driver "
+                   "update may help.");
+    exit(1);
+}
+
 static void pick_device(void) {
     uint32_t n = 0;
     vkEnumeratePhysicalDevices(g_vk.inst, &n, NULL);
@@ -119,7 +146,7 @@ static void pick_device(void) {
         if ((int)i == want) score = 100;
         if (score > best_score) { best_score = score; best = (int)i; }
     }
-    if (best < 0) FATAL("no Vulkan 1.2 device\n");
+    if (best < 0) no_vulkan_1_2("no Vulkan 1.2 device");
     g_vk.phys = pd[best];
     free(pd);
     vkGetPhysicalDeviceProperties(g_vk.phys, &g_vk.props);
@@ -152,7 +179,8 @@ static void create_device(void) {
     if (g_vk.divisor) ext[n_ext++] = VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME;
     g_vk.stencil_export = has_ext(ep, ne, VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);  // (MSAA stencil resolve)
     if (g_vk.stencil_export) ext[n_ext++] = VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME;
-    bool fsr4 = g_config.fsr && g_config.fsr_upscaler == FSR_UP_4 && vk_fsr4_device_exts(ep, ne, ext, &n_ext);  // FSR 4: its extensions
+    no_exclusive = surface_caps2 && has_ext(ep, ne, "VK_EXT_full_screen_exclusive") && !getenv("MHGU_VK_EXCLUSIVE");
+    if (no_exclusive) ext[n_ext++] = "VK_EXT_full_screen_exclusive";
     free(ep);
 
     // optional features: whatever the GPU has of what the backend can use
@@ -164,7 +192,7 @@ static void create_device(void) {
     VkPhysicalDeviceVulkan11Features f11_have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .pNext = &f12_have};
     VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f11_have};
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
-    if (!f12_have.timelineSemaphore) FATAL("the GPU driver has no timeline semaphores (Vulkan 1.2 required)\n");
+    if (!f12_have.timelineSemaphore) no_vulkan_1_2("the GPU driver has no timeline semaphores");
     g_vk.divisor = g_vk.divisor && div_have.vertexAttributeInstanceRateDivisor;
     g_vk.custom_border = g_vk.custom_border && cbc_have.customBorderColors && cbc_have.customBorderColorWithoutFormat;
 
@@ -189,7 +217,7 @@ static void create_device(void) {
     b->logicOp = h->logicOp;
     b->fillModeNonSolid = h->fillModeNonSolid;
     b->samplerAnisotropy = h->samplerAnisotropy;
-    b->textureCompressionBC = h->textureCompressionBC;
+    b->textureCompressionBC = g_vk.bc = h->textureCompressionBC && !(getenv("MHGU_NO_BC") && atoi(getenv("MHGU_NO_BC")));
     b->textureCompressionASTC_LDR = h->textureCompressionASTC_LDR;
     b->shaderInt64 = h->shaderInt64;
     b->depthBiasClamp = h->depthBiasClamp;
@@ -198,7 +226,7 @@ static void create_device(void) {
     b->largePoints = h->largePoints;
     b->wideLines = h->wideLines;
     b->imageCubeArray = h->imageCubeArray;
-    b->sampleRateShading = h->sampleRateShading;
+    b->sampleRateShading = g_vk.sample_shading = h->sampleRateShading;
     b->fragmentStoresAndAtomics = h->fragmentStoresAndAtomics;
     b->vertexPipelineStoresAndAtomics = h->vertexPipelineStoresAndAtomics;
     b->robustBufferAccess = h->robustBufferAccess;  // guest shaders index cbufs freely: keep OOB reads harmless
@@ -209,7 +237,6 @@ static void create_device(void) {
         b->shaderStorageImageReadWithoutFormat = h->shaderStorageImageReadWithoutFormat;
         f12.shaderFloat16 = b->shaderInt16 = g_vk.fsr_fp16 = f12_have.shaderFloat16 && h->shaderInt16;  // (both, or neither)
     }
-    if (fsr4) vk_fsr4_device_features(&f11, &f12, b);  // FSR 4: cooperative matrix, float8... (only when asked for)
     if (!h->shaderInt64) LOG("[vk] warning: no shaderInt64 (64-bit address math in shaders)\n");
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
@@ -217,9 +244,12 @@ static void create_device(void) {
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = 1,
                              .pQueueCreateInfos = &qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
     VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
+    g_vk.get_semaphore_counter = (PFN_vkGetSemaphoreCounterValue)vkGetDeviceProcAddr(g_vk.dev, "vkGetSemaphoreCounterValue");
+    g_vk.wait_semaphores = (PFN_vkWaitSemaphores)vkGetDeviceProcAddr(g_vk.dev, "vkWaitSemaphores");
+    if (!g_vk.get_semaphore_counter || !g_vk.wait_semaphores) no_vulkan_1_2("the GPU driver has no vkWaitSemaphores");
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
-    LOG("[vk] features: divisor %d, custom border %d, BC %d, ASTC %d\n", g_vk.divisor, g_vk.custom_border,
-        h->textureCompressionBC, h->textureCompressionASTC_LDR);
+    LOG("[vk] features: divisor %d, custom border %d, BC %d, ASTC %d, exclusive full screen off %d\n", g_vk.divisor,
+        g_vk.custom_border, g_vk.bc, h->textureCompressionASTC_LDR, no_exclusive);
 
     // MSAA (settings): as many samples as asked for that colour and depth attachments both support and shaders can
     // read from depth (its resolve is a shader: exec.c vk_ms_resolve)
@@ -300,12 +330,15 @@ void vk_set_msaa(uint32_t n) {
 }
 
 // ================================================================== swapchain
+static int swapchain_vsync = -1;
+static int configured_msaa = -1;
 static VkPresentModeKHR present_mode(void) {
+    swapchain_vsync = config_live_vsync();
     // MAILBOX by default: no tearing, and the game paces itself (its own 30 fps vsync waits); with FIFO the game's frames
     // also queued behind the display's, dropping to ~26 fps on the R9. FIFO where there is no mailbox.
     const char *e = getenv("MHGU_VK_PRESENT"), *v = getenv("MHGU_VSYNC");
     if (!e && v) e = atoi(v) ? "fifo" : "immediate";
-    if (!e) e = g_config.vsync ? "mailbox" : "immediate";  // (mhgurecomp.ini VSync)
+    if (!e) e = swapchain_vsync ? "mailbox" : "immediate";  // (mhgurecomp.ini VSync)
     VkPresentModeKHR want = !strcmp(e, "fifo") ? VK_PRESENT_MODE_FIFO_KHR
                           : !strcmp(e, "immediate") ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_MAILBOX_KHR;
     uint32_t n = 0;
@@ -348,6 +381,9 @@ static void create_swapchain(void) {
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = caps.currentTransform,
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = present_mode(), .clipped = VK_TRUE,
         .oldSwapchain = old};
+    FullScreenExclusiveInfo fse = {.sType = VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT,
+                                   .fullScreenExclusive = FULL_SCREEN_EXCLUSIVE_DISALLOWED};
+    if (no_exclusive) ci.pNext = &fse;
     VK_CHECK(vkCreateSwapchainKHR(g_vk.dev, &ci, NULL, &g_vk.swapchain));
     for (uint32_t i = 0; i < g_vk.sc_count; i++) {
         vkDestroyFramebuffer(g_vk.dev, sc_fb[i], NULL);
@@ -418,7 +454,13 @@ static bool frame_begin(void) {
     int w, h;
     SDL_GetWindowSizeInPixels(ui_window(), &w, &h);
     if (!w || !h) return false;  // minimised
-    if (!g_vk.swapchain || (uint32_t)w != g_vk.sc_extent.width || (uint32_t)h != g_vk.sc_extent.height) recreate_swapchain();
+    // All GPU mutations happen here under vk_lock(), after resolving the old
+    // scene. Existing attachment caches defer old image destruction safely.
+    int msaa = config_live_msaa();
+    if (configured_msaa < 0) configured_msaa = g_config.msaa;
+    if (msaa != configured_msaa) { vk_set_msaa((uint32_t)msaa); configured_msaa = msaa; }
+    if (!g_vk.swapchain || (uint32_t)w != g_vk.sc_extent.width || (uint32_t)h != g_vk.sc_extent.height ||
+        config_live_vsync() != swapchain_vsync) recreate_swapchain();
     if (!g_vk.swapchain) return false;
     slot = (slot + 1) % FRAMES;
     if (!acquire_sem[slot]) acquire_sem[slot] = binary_semaphore();
@@ -513,6 +555,10 @@ static void frame_end(const char *shot_path) {
 
 void vk_save_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h) {
     SDL_Surface *s = SDL_CreateSurfaceFrom((int)w, (int)h, SDL_PIXELFORMAT_ABGR8888, (void *)rgba, (int)w * 4);
+#ifdef __ANDROID__
+    char abs[1400], cwd[1024];  // (Android's SDL opens a relative path inside the APK's assets: from the app's folder)
+    if (path[0] != '/' && getcwd(cwd, sizeof cwd)) snprintf(abs, sizeof abs, "%s/%s", cwd, path), path = abs;
+#endif
     if (!s || !SDL_SavePNG(s, path)) LOG("[vk] saving %s failed: %s\n", path, SDL_GetError());
     else LOG("[vk] saved %s (%ux%u)\n", path, w, h);
     SDL_DestroySurface(s);
@@ -581,6 +627,11 @@ void backend_present(NvnTexture *t) {
             if (--left > 0) { g_dump_frame++; g_dump_no = 0; }
             else g_dump_active = 0;
         } else if (g_dump_request) { left = g_dump_request; g_dump_request = 0; g_dump_no = 0; g_dump_frame = 0; g_dump_active = 1; }
+    }
+    {   // (debug) MHGU_CONTROL "hudtrace": the next whole frame's HUD quads (exec.c cbuf_info)
+        extern volatile int g_hudtrace_active, g_hudtrace_request;
+        if (g_hudtrace_active) { LOG("[hud] frame done\n"); g_hudtrace_active--; }  // (2: the frame recorded next may run late)
+        else if (g_hudtrace_request) { g_hudtrace_request = 0; g_hudtrace_active = 2; }
     }
     { void vk_gpuprof_frame(void); vk_gpuprof_frame(); }  // (debug) MHGU_CONTROL "gpuprof"
     vk_unlock();

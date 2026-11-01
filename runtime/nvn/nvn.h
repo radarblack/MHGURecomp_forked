@@ -61,7 +61,10 @@ typedef struct NvnTexture {
     void *backend;  // renderer-side texture
     uint64_t debug_id;
     char label[64];
+    bool screenshot;  // a buffer of the game's sScreenShot (made while g_nvn_making_screenshot was set)
 } NvnTexture;
+// Set by runtime/hle/camera_jitter.c on the thread making the game's screenshot buffers, while it does
+extern _Thread_local bool g_nvn_making_screenshot;
 
 typedef struct {
     uint32_t min_filter, mag_filter, wrap[3], compare_mode, compare_func, reduction;
@@ -171,6 +174,8 @@ void backend_execute(uint64_t handle);            // run a recorded command list
 void backend_present(NvnTexture *tex);            // show a texture in the window
 void backend_texture_destroyed(NvnTexture *tex);
 void backend_pool_written(uint64_t addr, uint64_t size);
+void backend_program_created(const NvnProgram *p);  // nvnProgramSetShaders (the renderer may prepare it ahead of use)
+void backend_photo_requested(void);  // the game asked for its quest photo (tools/gen.py: 0xa6f97c): drawn in the next frames
 void renderer_sync(void);
 uint64_t renderer_fence_seq(void);
 void renderer_wait_seq(uint64_t seq);

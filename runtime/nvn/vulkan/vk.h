@@ -35,8 +35,13 @@ typedef struct {
     VkPhysicalDeviceProperties props;
     VkPipelineCache pcache;
     VkSemaphore timeline;      // value = last completed submission number
+    // (from the driver: Android 10 and 11's libvulkan.so has no Vulkan 1.2 functions, whatever the driver supports, and
+    // importing one stops the game from starting)
+    PFN_vkGetSemaphoreCounterValue get_semaphore_counter;
+    PFN_vkWaitSemaphores wait_semaphores;
     VkCommandPool pool;        // render thread only
-    bool divisor, demote, custom_border, depth_clamp, stencil_export;
+    bool divisor, demote, custom_border, depth_clamp, stencil_export, sample_shading;
+    bool bc;                   // textureCompressionBC (MHGU_NO_BC=1: off, as phone GPUs report; textures.c decodes BC)
     volatile uint32_t msaa;    // samples for the 3D scene's passes (settings MSAA, as far as the GPU allows): 1 = off
     uint32_t msaa_counts;      // the sample counts MSAA can use (bits 2, 4, 8)
     bool fsr_fp16, fsr_storage_wo_format;  // FSR (fsr.c): shaderFloat16 / shaderStorageImageWriteWithoutFormat enabled
@@ -97,6 +102,7 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout);
 // Render passes / framebuffers (exec.c): all attachments LOAD / STORE in GENERAL layout (samples > 1, MSAA: in the
 // attachment layouts). depth: the depth/stencil format (UNDEFINED: none).
 VkRenderPass vk_render_pass(const VkFormat *color, uint32_t ncolor, VkFormat depth, uint32_t samples);
+VkFormat vk_depth24_stencil8(void);  // the format DEPTH24_STENCIL8 is made as (D32_SFLOAT_S8_UINT on AMD)
 VkFramebuffer vk_framebuffer(VkRenderPass rp, const VkImageView *views, uint32_t n, uint32_t w, uint32_t h);
 void vk_framebuffers_forget_view(VkImageView v);  // (textures.c: a view is going away)
 
@@ -116,11 +122,23 @@ typedef struct TexBackend {
     uint32_t pending_w, pending_h, pending_stride;
     uint8_t astc_bw, astc_bh;  // ASTC without GPU support: decoded to RGBA8 on upload (runtime/nvn/astc.c)
     bool astc_srgb;
+    uint8_t bcn;               // BC without GPU support (BCN_*): decoded on upload (runtime/nvn/bcn.c)
     struct TexBackend *ms;  // MSAA: the multisampled image this one is rendered through (textures.c vk_tex_ms)
     bool ms_valid;          // ms holds this image's contents (its last write was a pass through ms)
     bool ms_dirty;          // ms is newer than this image: resolved when this one is next read (exec.c vk_ms_resolve)
     VkFormat ms_fmt;        // the format ms is rendered as
+    bool wide;              // RGBA16 UNORM standing in for the game's RGBA8 render target (textures.c vk_rt_widen)
+    uint64_t ms_models;     // (colour) the frame 3D models (depth-writing draws) were last drawn into this image, once
+                            // a pass without MSAA did (g_present_count; menus: exec.c ms_expand), 0 none lately
 } TexBackend;
+
+bool vk_wide_rt_on(void);  // (textures.c) RGBA8 render targets as RGBA16 UNORM ([Graphics] SmoothGradients)
+void vk_rt_widen(NvnTexture *t, bool wide);  // (exec.c begin_pass, outside a render pass)
+// Images of a compressed format the GPU lacks (ASTC on desktop, BC on phones) hold decoded texels: blocks
+// (row-major, w x h texels' worth) -> w*h texels of vk_tex_texel_size bytes, tightly packed.
+static inline bool vk_tex_decoded(const TexBackend *b) { return b->astc_bw || b->bcn; }
+uint32_t vk_tex_texel_size(const TexBackend *b);
+void vk_tex_decode(const TexBackend *b, const uint8_t *blocks, uint32_t w, uint32_t h, uint8_t *out);
 
 TexBackend *vk_tex(NvnTexture *t, bool for_render);  // backend image (uploads CPU contents unless for_render)
 VkFormat vk_format(uint32_t nvn_format);
